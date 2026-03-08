@@ -64,6 +64,13 @@ try:
 except ImportError:
     HAS_INSTALOADER = False
 
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -1462,6 +1469,159 @@ def save_markdown_table(sales: list[SampleSale], filename: str):
 
 
 # ---------------------------------------------------------------------------
+# Database: PostgreSQL Storage
+# ---------------------------------------------------------------------------
+
+DB_URL = os.environ.get("DATABASE_URL", "")
+
+
+def get_db_connection():
+    """Get a PostgreSQL connection using DATABASE_URL."""
+    if not HAS_PSYCOPG2:
+        print("  psycopg2 not installed — skipping database operations")
+        return None
+    if not DB_URL:
+        return None
+    try:
+        conn = psycopg2.connect(DB_URL)
+        return conn
+    except Exception as e:
+        print(f"  Database connection failed: {e}")
+        return None
+
+
+def init_db():
+    """Initialize database schema from db_schema.sql."""
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        schema_path = Path(__file__).parent / "db_schema.sql"
+        with open(schema_path, "r") as f:
+            schema_sql = f.read()
+        with conn.cursor() as cur:
+            cur.execute(schema_sql)
+        conn.commit()
+        print("  Database schema initialized")
+        return True
+    except Exception as e:
+        print(f"  Database init failed: {e}")
+        conn.rollback()
+        return False
+    finally:
+        conn.close()
+
+
+def upsert_sales(sales: list, month_year: str = None):
+    """Insert or update sales in the database, skipping duplicates via dedup_key."""
+    conn = get_db_connection()
+    if not conn:
+        return 0
+    if month_year is None:
+        month_year = datetime.now().strftime("%Y-%m")
+    inserted = 0
+    try:
+        with conn.cursor() as cur:
+            for s in sales:
+                try:
+                    # Parse dates to DATE type, or NULL if unparseable
+                    start_dt = _parse_date_for_db(s.start_date)
+                    end_dt = _parse_date_for_db(s.end_date)
+                    cur.execute("""
+                        INSERT INTO sample_sales
+                            (brand, department, start_date, end_date, location, link, notes, source, month_year, dedup_key)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (dedup_key) DO UPDATE SET
+                            department = COALESCE(NULLIF(sample_sales.department, 'Various'), EXCLUDED.department),
+                            location = COALESCE(NULLIF(sample_sales.location, ''), EXCLUDED.location),
+                            notes = COALESCE(NULLIF(sample_sales.notes, ''), EXCLUDED.notes),
+                            source = EXCLUDED.source,
+                            scraped_at = NOW()
+                    """, (
+                        s.brand, s.department, start_dt, end_dt,
+                        s.location, s.link, s.notes, s.source,
+                        month_year, s.dedup_key()
+                    ))
+                    inserted += 1
+                except Exception as e:
+                    print(f"  Failed to upsert {s.brand}: {e}")
+        conn.commit()
+        print(f"  Persisted {inserted} sales to database")
+    except Exception as e:
+        print(f"  Database upsert failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+    return inserted
+
+
+def _parse_date_for_db(date_str: str):
+    """Parse a date string to a Python date for PostgreSQL, or return None."""
+    if not date_str or not date_str.strip():
+        return None
+    for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(date_str.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def upsert_discovered_accounts(accounts: list[dict]):
+    """Persist discovered accounts to the database."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            for acct in accounts:
+                cur.execute("""
+                    INSERT INTO discovered_accounts
+                        (platform, username, source_name, discovered_from, discovered_date, relevance_score, enabled)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (username) DO UPDATE SET
+                        relevance_score = GREATEST(discovered_accounts.relevance_score, EXCLUDED.relevance_score),
+                        enabled = EXCLUDED.enabled
+                """, (
+                    acct.get("platform", ""),
+                    acct.get("username", ""),
+                    acct.get("source_name", ""),
+                    acct.get("discovered_from", ""),
+                    acct.get("discovered_date", datetime.now().date()),
+                    acct.get("relevance_score", 0.0),
+                    acct.get("enabled", True),
+                ))
+        conn.commit()
+        print(f"  Persisted {len(accounts)} discovered accounts to database")
+    except Exception as e:
+        print(f"  Account upsert failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+def log_scrape_run(web_count: int, social_count: int, verified_count: int, total_unique: int, new_accounts: int = 0):
+    """Log a scrape run to the database."""
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO scrape_runs
+                    (web_sales_count, social_sales_count, verified_sales_count, total_unique, new_accounts_discovered)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (web_count, social_count, verified_count, total_unique, new_accounts))
+        conn.commit()
+        print("  Scrape run logged to database")
+    except Exception as e:
+        print(f"  Failed to log scrape run: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1515,10 +1675,35 @@ def main():
     save_markdown_table(unique_sales, md_path)
     print_markdown_table(unique_sales)
 
+    # Phase 4: Persist to PostgreSQL (if configured)
+    if DB_URL:
+        print("\n--- Phase 4: PostgreSQL Persistence ---")
+        init_db()
+        upsert_sales(unique_sales)
+        log_scrape_run(
+            web_count=len(live_sales),
+            social_count=len(social_sales),
+            verified_count=len(verified_sales),
+            total_unique=len(unique_sales),
+        )
+        # Persist discovered accounts if file exists
+        disc_path = Path(__file__).parent / "discovered_accounts.json"
+        if disc_path.exists():
+            try:
+                with open(disc_path, "r") as f:
+                    disc_data = json.load(f)
+                upsert_discovered_accounts(disc_data)
+            except Exception as e:
+                print(f"  Could not persist discovered accounts: {e}")
+    else:
+        print("\n  (Set DATABASE_URL to enable PostgreSQL persistence)")
+
     print(f"\n{'=' * 60}")
     print(f"  Done! {len(unique_sales)} unique NYC sample sales for March 2026")
     print(f"  CSV:      {csv_path}")
     print(f"  Markdown: {md_path}")
+    if DB_URL:
+        print(f"  Database: PostgreSQL (connected)")
     print(f"{'=' * 60}")
 
 
