@@ -2,29 +2,42 @@
 """
 NYC Sample Sale Scraper — March 2026
 =====================================
-Scrapes upcoming/active sample sales from four major NYC aggregators:
-  1. 260 Sample Sale (https://260samplesale.com/pages/nyc-schedule)
-  2. Chicmi NYC (https://www.chicmi.com/new-york/sample-sales/)
-  3. Lazar Shopping (https://lazarshopping.com/)
-  4. NYC Insider Guide (https://www.nycinsiderguide.com/nyc-shopping/sample-sales)
+Scrapes upcoming/active sample sales from:
 
-Uses Playwright (headless Chromium) for JS-rendered pages with BeautifulSoup
-for HTML parsing. Falls back to requests if Playwright is unavailable.
+  Website aggregators:
+    1. 260 Sample Sale (https://260samplesale.com/pages/nyc-schedule)
+    2. Chicmi NYC (https://www.chicmi.com/new-york/sample-sales/)
+    3. Lazar Shopping (https://lazarshopping.com/)
+    4. NYC Insider Guide (https://www.nycinsiderguide.com/nyc-shopping/sample-sales)
 
-If network access is restricted (proxy/firewall), the script uses verified
-data collected from web search APIs as a reliable fallback.
+  Social media accounts (Instagram via Instaloader, Threads via Playwright):
+    5. @260samplesale (Instagram)
+    6. @chicaboratanyc (Instagram)
+    7. @lazaboratasamplesales (Instagram)
+    8. @nycstealzanddeals (Instagram)
+    9. @thestylishcity (Instagram)
+   10. @vipsamplesalenewyork (Threads)
+
+  Auto-discovery: Learns new accounts from @mentions and hashtags, persisted
+  in discovered_accounts.json for subsequent runs.
 
 Outputs:
   - nyc_sample_sales_march_2026.csv
   - nyc_sample_sales_march_2026.md
+  - discovered_accounts.json (auto-generated)
 """
 
 import csv
+import os
 import re
 import json
 import hashlib
+import random
 import sys
+import time
+from datetime import datetime, timedelta
 from dataclasses import dataclass, asdict
+from pathlib import Path
 
 # Optional imports — graceful degradation
 try:
@@ -44,6 +57,39 @@ try:
     HAS_REQUESTS = True
 except ImportError:
     HAS_REQUESTS = False
+
+try:
+    import instaloader
+    HAS_INSTALOADER = True
+except ImportError:
+    HAS_INSTALOADER = False
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+DISCOVERED_ACCOUNTS_FILE = SCRIPT_DIR / "discovered_accounts.json"
+
+SOCIAL_MEDIA_ACCOUNTS = {
+    "instagram": {
+        "260samplesale": {"enabled": True, "source_name": "Instagram @260samplesale"},
+        "chicaboratanyc": {"enabled": True, "source_name": "Instagram @chicaboratanyc"},
+        "lazaboratasamplesales": {"enabled": True, "source_name": "Instagram @lazaboratasamplesales"},
+        "nycstealzanddeals": {"enabled": True, "source_name": "Instagram @nycstealzanddeals"},
+        "thestylishcity": {"enabled": True, "source_name": "Instagram @thestylishcity"},
+    },
+    "threads": {
+        "vipsamplesalenewyork": {"enabled": True, "source_name": "Threads @vipsamplesalenewyork"},
+    },
+}
+
+DISCOVERY_HASHTAGS = ["nycsamplesale", "samplesalenyc", "260samplesale", "nycsamplesales"]
+
+# Max posts to fetch per account (keep low to respect rate limits)
+IG_MAX_POSTS = 12
+THREADS_MAX_POSTS = 10
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +144,23 @@ BRAND_DEPARTMENT_MAP = {
     # Haute Couture / Multi-brand
     "msa haute couture": "Womenswear, Haute Couture",
     "carlisle": "Womenswear",
+    # Additional brands commonly seen on social media
+    "anine bing": "Womenswear", "agolde": "Womenswear", "aritzia": "Womenswear",
+    "khaite": "Womenswear", "toteme": "Womenswear", "le labo": "Beauty",
+    "diptyque": "Beauty", "byredo": "Beauty", "aesop": "Beauty",
+    "the row": "Womenswear", "nili lotan": "Womenswear",
+    "zadig & voltaire": "Womenswear, Menswear",
+    "rebecca minkoff": "Womenswear, Accessories",
+    "3.1 phillip lim": "Womenswear, Menswear",
+    "oscar de la renta": "Womenswear, Haute Couture",
+    "carolina herrera": "Womenswear, Haute Couture",
+    "monse": "Womenswear", "jonathan simkhai": "Womenswear",
+    "jason wu": "Womenswear", "prabal gurung": "Womenswear",
+    "cushnie": "Womenswear", "brandon maxwell": "Womenswear",
+    "l'agence": "Womenswear", "chanel": "Womenswear, Accessories",
+    "dior": "Womenswear, Accessories", "versace": "Womenswear, Accessories",
+    "dolce & gabbana": "Womenswear, Menswear", "etro": "Womenswear, Menswear",
+    "emilio pucci": "Womenswear", "taller marmo": "Womenswear",
 }
 
 
@@ -136,9 +199,10 @@ DATE_PATTERNS = [
 ]
 
 LOCATION_PATTERNS = [
-    r"(\d+\s+(?:Fifth|Madison|Park|Lexington|Broadway|West|East|Spring|Wooster|Greene|Mercer|Prince|Houston|Canal|Broome|Grand|Bleecker|Christopher|Hudson|Washington|Warren|Church|Centre|Lafayette|Bowery|Elizabeth|Mott|Mulberry|Orchard|Rivington|Delancey|Allen|Essex|Norfolk|Suffolk|Clinton|Attorney|Ridge|Pitt|Columbia|Lewis|Stanton|Avenue|Street|St|Ave|Blvd|Place|Pl|Road|Rd|Way|Drive|Dr|Lane|Ln|Court|Ct)\b[^,\n]{0,50})",
-    r"(260\s+(?:Fifth|Sample|sample)[^,\n]{0,30})",
-    r"(\d+\s+\w+\s+(?:St|Ave|Street|Avenue|Blvd|Boulevard|Place|Pl|Road|Rd|Way|Drive|Dr)\b[^,\n]{0,40})",
+    r"(\d+\s+(?:Fifth|Madison|Park|Lexington|Broadway|West|East|Spring|Wooster|Greene|Mercer|Prince|Houston|Canal|Broome|Grand|Bleecker|Christopher|Hudson|Washington|Warren|Church|Centre|Lafayette|Bowery|Elizabeth|Mott|Mulberry|Orchard|Rivington|Delancey|Allen|Essex|Norfolk|Suffolk|Clinton|Attorney|Ridge|Pitt|Columbia|Lewis|Stanton|Avenue|Street|St|Ave|Blvd|Place|Pl|Road|Rd|Way|Drive|Dr|Lane|Ln|Court|Ct)\b[^,\n!\.]{0,30})",
+    r"(260\s+(?:Fifth|Sample|sample)[^,\n!\.]{0,30})",
+    r"(\d+\s+[EWNS]\.?\s+\d+\w*\s+(?:St|Ave|Street|Avenue|Blvd|Pl|Place)\b[^,\n!\.]{0,30})",
+    r"(\d+\s+\w+\s+(?:St|Ave|Street|Avenue|Blvd|Boulevard|Place|Pl|Road|Rd|Way|Drive|Dr)\b[^,\n!\.]{0,30})",
 ]
 
 
@@ -205,7 +269,623 @@ def clean_brand(brand: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Scraper: Playwright + BeautifulSoup
+# Social Media: Caption Parsing Pipeline
+# ---------------------------------------------------------------------------
+
+EMOJI_PATTERN = re.compile(
+    "[\U0001F600-\U0001F64F"  # emoticons
+    "\U0001F300-\U0001F5FF"  # symbols & pictographs
+    "\U0001F680-\U0001F6FF"  # transport & map
+    "\U0001F1E0-\U0001F1FF"  # flags
+    "\U00002702-\U000027B0"  # dingbats
+    "\U0000FE00-\U0000FE0F"  # variation selectors
+    "\U0001F900-\U0001F9FF"  # supplemental symbols
+    "\U0001FA00-\U0001FA6F"  # chess symbols
+    "\U0001FA70-\U0001FAFF"  # symbols extended
+    "\U00002600-\U000026FF"  # misc symbols
+    "\U0000200D"             # zero width joiner
+    "\U00002B50\U00002B55"   # stars
+    "\U0000231A-\U0000231B"  # watch/hourglass
+    "]+", flags=re.UNICODE,
+)
+
+WEEKDAY_MAP = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3,
+    "fri": 4, "sat": 5, "sun": 6,
+}
+
+
+def normalize_caption(text: str) -> tuple[str, list[str], list[str]]:
+    """Strip emoji, extract hashtags and mentions, normalize whitespace (preserve newlines)."""
+    hashtags = re.findall(r"#(\w+)", text)
+    mentions = re.findall(r"@(\w+)", text)
+    cleaned = EMOJI_PATTERN.sub(" ", text)
+    cleaned = re.sub(r"#\w+", " ", cleaned)
+    cleaned = re.sub(r"@\w+", " ", cleaned)
+    # Preserve newlines for multi-sale splitting, but collapse other whitespace
+    cleaned = re.sub(r"[^\S\n]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip(), hashtags, mentions
+
+
+def resolve_relative_dates(text: str, reference_date: str) -> tuple[str, str]:
+    """Convert 'today', 'tomorrow', 'this weekend', 'starts Friday' to absolute dates."""
+    try:
+        ref = datetime.strptime(reference_date, "%Y-%m-%d") if reference_date else datetime.now()
+    except ValueError:
+        ref = datetime.now()
+
+    text_lower = text.lower()
+
+    if re.search(r"\btoday\b", text_lower):
+        d = ref.strftime("%B %d, %Y")
+        return (d, d)
+
+    if re.search(r"\btomorrow\b", text_lower):
+        d = (ref + timedelta(days=1)).strftime("%B %d, %Y")
+        return (d, d)
+
+    m = re.search(r"\bthis\s+weekend\b", text_lower)
+    if m:
+        days_until_sat = (5 - ref.weekday()) % 7
+        if days_until_sat == 0 and ref.weekday() != 5:
+            days_until_sat = 7
+        sat = ref + timedelta(days=days_until_sat)
+        sun = sat + timedelta(days=1)
+        return (sat.strftime("%B %d, %Y"), sun.strftime("%B %d, %Y"))
+
+    m = re.search(r"\bstarts?\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun)\b", text_lower)
+    if m:
+        target_day = WEEKDAY_MAP.get(m.group(1).lower())
+        if target_day is not None:
+            days_ahead = (target_day - ref.weekday()) % 7
+            if days_ahead == 0:
+                days_ahead = 7
+            start = ref + timedelta(days=days_ahead)
+            return (start.strftime("%B %d, %Y"), "")
+
+    return ("", "")
+
+
+def extract_brand_from_caption(text: str, hashtags: list[str]) -> str:
+    """
+    Extract brand name from social media caption text.
+    Priority: known brands → "X SAMPLE SALE" pattern → ALL-CAPS → hashtag brands.
+    """
+    text_lower = text.lower()
+
+    # 1. Check for known brands in the text
+    best_match = ""
+    best_len = 0
+    for brand_key in BRAND_DEPARTMENT_MAP:
+        if brand_key in text_lower and len(brand_key) > best_len:
+            best_match = brand_key
+            best_len = len(brand_key)
+    if best_match:
+        # Find the original-case version in the text
+        m = re.search(re.escape(best_match), text, re.IGNORECASE)
+        if m:
+            return m.group(0)
+        return best_match.title()
+
+    # 2. "BRAND SAMPLE SALE" pattern — words before "sample sale"
+    m = re.search(r"([\w\s&\.\'\-]+?)\s+sample\s+sale", text, re.IGNORECASE)
+    if m:
+        candidate = m.group(1).strip()
+        # Filter out generic words
+        if candidate.lower() not in ("the", "a", "our", "this", "nyc", "new york", "annual", "big", "huge", "mega"):
+            return clean_brand(candidate)
+
+    # 3. ALL-CAPS sequences (common Instagram style: "REFORMATION SAMPLE SALE")
+    caps_matches = re.findall(r"\b([A-Z][A-Z\s&\.\'\-]{2,}[A-Z])\b", text)
+    for cap in caps_matches:
+        cap_clean = cap.strip()
+        if cap_clean.lower() not in ("sample sale", "nyc", "new york", "rsvp", "dm", "link in bio"):
+            return clean_brand(cap_clean.title())
+
+    # 4. Check hashtags for brand names
+    for tag in hashtags:
+        tag_lower = tag.lower()
+        for brand_key in BRAND_DEPARTMENT_MAP:
+            normalized = brand_key.replace(" ", "").replace("&", "and").replace(".", "")
+            if tag_lower == normalized or normalized in tag_lower:
+                return brand_key.title()
+
+    return ""
+
+
+def split_multi_sale_caption(text: str) -> list[str]:
+    """Split captions that announce multiple sales into segments."""
+    # Check for numbered lists: "1. Brand...\n2. Brand..."
+    # Use findall to capture all numbered items (handles text before "1." correctly)
+    numbered_items = re.findall(r"(?:^|\n)\s*\d+[\.\)]\s+(.*?)(?=\n\s*\d+[\.\)]|\Z)", text, re.DOTALL)
+    if len(numbered_items) >= 2:
+        return [s.strip() for s in numbered_items if s.strip()]
+
+    # Check for bullet-style: "• Brand..." or "- Brand..."
+    bullet_items = re.findall(r"(?:^|\n)\s*[•\-\*]\s+(.*?)(?=\n\s*[•\-\*]|\Z)", text, re.DOTALL)
+    if len(bullet_items) >= 2:
+        return [s.strip() for s in bullet_items if s.strip()]
+
+    # Check for double-newline separated blocks with dates in each
+    blocks = re.split(r"\n\s*\n", text)
+    if len(blocks) > 1:
+        blocks_with_dates = [b for b in blocks if re.search(
+            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|\d{1,2}/\d{1,2})", b, re.IGNORECASE
+        )]
+        if len(blocks_with_dates) > 1:
+            return [b.strip() for b in blocks if b.strip()]
+
+    return [text]
+
+
+def parse_social_caption(
+    caption: str, account: str, post_url: str, post_date: str
+) -> list[SampleSale]:
+    """
+    Parse a social media caption into structured SampleSale objects.
+    Returns a list because one caption may announce multiple sales.
+    """
+    if not caption:
+        return []
+
+    cleaned, hashtags, mentions = normalize_caption(caption)
+    segments = split_multi_sale_caption(cleaned)
+    sales = []
+
+    for segment in segments:
+        brand = extract_brand_from_caption(segment, hashtags)
+        if not brand:
+            brand = extract_brand_from_caption(cleaned, hashtags)
+        if not brand or len(brand) < 2:
+            continue
+
+        # Try standard date parsing first
+        start, end = parse_date_range(segment)
+        if not start:
+            start, end = parse_date_range(cleaned)
+        # Try relative dates as fallback
+        if not start:
+            start, end = resolve_relative_dates(segment, post_date)
+        if not start:
+            start, end = resolve_relative_dates(cleaned, post_date)
+
+        # Skip if still no date (can't create useful entry without timing)
+        if not start:
+            continue
+
+        location = extract_location(segment) or extract_location(cleaned)
+        notes = extract_notes(segment) or extract_notes(cleaned)
+        link = post_url or ""
+
+        sale = SampleSale(
+            brand=clean_brand(brand),
+            start_date=start,
+            end_date=end,
+            location=location,
+            link=link,
+            notes=notes,
+            source=f"Instagram @{account}",
+        )
+        sale.department = infer_department(sale.brand)
+        sales.append(sale)
+
+    return sales
+
+
+# ---------------------------------------------------------------------------
+# Social Media: Instagram Scraper (Instaloader)
+# ---------------------------------------------------------------------------
+
+def scrape_instagram_account(
+    loader: "instaloader.Instaloader",
+    username: str,
+    source_name: str,
+    max_posts: int = IG_MAX_POSTS,
+) -> tuple[list[SampleSale], list[dict]]:
+    """
+    Scrape recent posts from a public Instagram profile.
+    Returns (sales, raw_posts) where raw_posts contains caption/metadata for discovery.
+    """
+    sales = []
+    raw_posts = []
+
+    try:
+        profile = instaloader.Profile.from_username(loader.context, username)
+        count = 0
+        for post in profile.get_posts():
+            if count >= max_posts:
+                break
+            caption = post.caption or ""
+            post_date = post.date_utc.strftime("%Y-%m-%d") if post.date_utc else ""
+            post_url = f"https://www.instagram.com/p/{post.shortcode}/"
+
+            raw_posts.append({
+                "caption": caption,
+                "url": post_url,
+                "date": post_date,
+                "account": username,
+            })
+
+            parsed = parse_social_caption(caption, username, post_url, post_date)
+            for s in parsed:
+                s.source = source_name
+            sales.extend(parsed)
+            count += 1
+
+    except instaloader.exceptions.ProfileNotExistsException:
+        print(f"    [WARN] Profile @{username} does not exist")
+    except instaloader.exceptions.LoginRequiredException:
+        print(f"    [WARN] Login required for @{username}, skipping")
+    except instaloader.exceptions.ConnectionException as e:
+        print(f"    [WARN] Connection error for @{username}: {e}")
+    except Exception as e:
+        print(f"    [ERROR] Failed to scrape @{username}: {e}")
+
+    return sales, raw_posts
+
+
+def run_instagram_scrapers(
+    accounts: dict[str, dict],
+) -> tuple[list[SampleSale], list[dict]]:
+    """Run Instaloader-based Instagram scrapers for all enabled accounts."""
+    if not HAS_INSTALOADER:
+        print("  [SKIP] Instaloader not installed, skipping Instagram scrape")
+        return [], []
+
+    all_sales = []
+    all_posts = []
+
+    loader = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_comments=False,
+        download_geotags=False,
+        save_metadata=False,
+        compress_json=False,
+        quiet=True,
+    )
+
+    for username, config in accounts.items():
+        if not config.get("enabled", False):
+            continue
+        print(f"  Scraping Instagram @{username}...")
+        sales, posts = scrape_instagram_account(
+            loader, username, config["source_name"]
+        )
+        all_sales.extend(sales)
+        all_posts.extend(posts)
+        print(f"    Found {len(sales)} sales from {len(posts)} posts")
+        # Rate-limit delay between accounts
+        time.sleep(random.uniform(3, 5))
+
+    return all_sales, all_posts
+
+
+# ---------------------------------------------------------------------------
+# Social Media: Threads Scraper (Playwright)
+# ---------------------------------------------------------------------------
+
+def scrape_threads_profile(
+    page, username: str, max_posts: int = THREADS_MAX_POSTS
+) -> list[dict]:
+    """Scrape recent posts from a public Threads profile via Playwright."""
+    url = f"https://www.threads.net/@{username}"
+    posts = []
+
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(4000)
+
+        # Scroll down to load more posts
+        for _ in range(3):
+            page.evaluate("window.scrollBy(0, 1000)")
+            page.wait_for_timeout(1500)
+
+        # Extract post content — Threads uses various container selectors
+        post_elements = page.query_selector_all(
+            "[data-pressable-container], article, [class*='post'], [class*='thread']"
+        )
+
+        for el in post_elements[:max_posts]:
+            try:
+                text = el.inner_text() or ""
+                # Try to find a time element for the post date
+                time_el = el.query_selector("time")
+                date_str = ""
+                if time_el:
+                    date_str = time_el.get_attribute("datetime") or ""
+                    if date_str:
+                        try:
+                            date_str = datetime.fromisoformat(
+                                date_str.replace("Z", "+00:00")
+                            ).strftime("%Y-%m-%d")
+                        except ValueError:
+                            pass
+
+                # Try to find a link for the post
+                link_el = el.query_selector("a[href*='/post/']")
+                post_url = ""
+                if link_el:
+                    href = link_el.get_attribute("href") or ""
+                    if href:
+                        post_url = f"https://www.threads.net{href}" if href.startswith("/") else href
+
+                if text and len(text) > 10:
+                    posts.append({
+                        "caption": text,
+                        "url": post_url or url,
+                        "date": date_str,
+                        "account": username,
+                    })
+            except Exception:
+                continue
+
+    except Exception as e:
+        print(f"    [ERROR] Failed to scrape Threads @{username}: {e}")
+
+    return posts
+
+
+def run_threads_scrapers(
+    accounts: dict[str, dict],
+) -> tuple[list[SampleSale], list[dict]]:
+    """Run Playwright-based Threads scrapers for all enabled accounts."""
+    if not HAS_PLAYWRIGHT:
+        print("  [SKIP] Playwright not available, skipping Threads scrape")
+        return [], []
+
+    all_sales = []
+    all_posts = []
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1280, "height": 720},
+            )
+            page = context.new_page()
+
+            for username, config in accounts.items():
+                if not config.get("enabled", False):
+                    continue
+                print(f"  Scraping Threads @{username}...")
+                posts = scrape_threads_profile(page, username)
+                all_posts.extend(posts)
+
+                for post in posts:
+                    parsed = parse_social_caption(
+                        post["caption"], username, post["url"], post["date"]
+                    )
+                    for s in parsed:
+                        s.source = config["source_name"]
+                    all_sales.extend(parsed)
+
+                print(f"    Found {len(all_sales)} sales from {len(posts)} posts")
+                time.sleep(random.uniform(5, 10))
+
+            browser.close()
+    except Exception as e:
+        print(f"  [ERROR] Threads scraping failed: {e}")
+
+    return all_sales, all_posts
+
+
+# ---------------------------------------------------------------------------
+# Social Media: Account Discovery System
+# ---------------------------------------------------------------------------
+
+DISCOVERY_RELEVANCE_KEYWORDS = {
+    "sample sale", "samplesale", "sample-sale", "warehouse sale",
+    "nyc", "new york", "manhattan", "soho", "noho", "nomad",
+    "260 sample", "260samplesale", "fashion", "designer",
+    "off retail", "% off", "discount", "clearance",
+}
+
+
+def load_discovered_accounts() -> dict:
+    """Load previously discovered accounts from JSON file."""
+    if DISCOVERED_ACCOUNTS_FILE.exists():
+        try:
+            with open(DISCOVERED_ACCOUNTS_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"instagram": {}, "threads": {}}
+
+
+def save_discovered_accounts(data: dict):
+    """Persist discovered accounts to JSON file."""
+    with open(DISCOVERED_ACCOUNTS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"  Discovery data saved to {DISCOVERED_ACCOUNTS_FILE}")
+
+
+def score_account_relevance(username: str, caption_context: str = "") -> float:
+    """Score 0.0–1.0 based on how relevant an account is to NYC sample sales."""
+    score = 0.0
+    combined = (username + " " + caption_context).lower()
+
+    for keyword in DISCOVERY_RELEVANCE_KEYWORDS:
+        if keyword in combined:
+            score += 0.15
+
+    # Bonus for username containing sale-related terms
+    uname = username.lower()
+    if any(w in uname for w in ("sample", "sale", "fashion", "shop", "deal", "steal")):
+        score += 0.2
+    if any(w in uname for w in ("nyc", "newyork", "manhattan")):
+        score += 0.15
+
+    return min(score, 1.0)
+
+
+def discover_accounts_from_posts(
+    raw_posts: list[dict],
+    existing_accounts: set[str],
+) -> dict[str, dict]:
+    """Mine @mentions from scraped posts to find new sample sale accounts."""
+    discovered = {}
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for post in raw_posts:
+        caption = post.get("caption", "")
+        account = post.get("account", "")
+        _, _, mentions = normalize_caption(caption)
+
+        for mention in mentions:
+            mention_lower = mention.lower()
+            if mention_lower in existing_accounts:
+                continue
+            if len(mention_lower) < 3:
+                continue
+
+            relevance = score_account_relevance(mention_lower, caption)
+            if relevance >= 0.3 and mention_lower not in discovered:
+                discovered[mention_lower] = {
+                    "discovered_from": f"@{account} mention",
+                    "discovered_date": today,
+                    "enabled": True,
+                    "relevance_score": round(relevance, 2),
+                    "source_name": f"Instagram @{mention_lower} (discovered)",
+                }
+
+    return discovered
+
+
+def discover_accounts_from_hashtags(
+    loader: "instaloader.Instaloader",
+    existing_accounts: set[str],
+    max_hashtags: int = 3,
+    max_posts_per_tag: int = 30,
+) -> dict[str, dict]:
+    """Explore hashtag pages to find new sample sale accounts."""
+    discovered = {}
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    for tag in DISCOVERY_HASHTAGS[:max_hashtags]:
+        try:
+            print(f"    Exploring #{tag}...")
+            hashtag = instaloader.Hashtag.from_name(loader.context, tag)
+            count = 0
+            for post in hashtag.get_posts():
+                if count >= max_posts_per_tag:
+                    break
+                owner = post.owner_username
+                if owner and owner.lower() not in existing_accounts:
+                    caption = post.caption or ""
+                    relevance = score_account_relevance(owner, caption)
+                    if relevance >= 0.3 and owner.lower() not in discovered:
+                        discovered[owner.lower()] = {
+                            "discovered_from": f"#{tag} hashtag",
+                            "discovered_date": today,
+                            "enabled": True,
+                            "relevance_score": round(relevance, 2),
+                            "source_name": f"Instagram @{owner} (discovered)",
+                        }
+                count += 1
+            time.sleep(random.uniform(3, 6))
+        except Exception as e:
+            print(f"    [WARN] Hashtag #{tag} exploration failed: {e}")
+
+    return discovered
+
+
+def run_account_discovery(
+    raw_posts: list[dict],
+    existing_accounts: set[str],
+) -> dict[str, dict]:
+    """Run the full account discovery pipeline."""
+    print("\n  --- Account Discovery ---")
+    all_discovered = {}
+
+    # 1. Discover from @mentions in scraped posts
+    mention_discoveries = discover_accounts_from_posts(raw_posts, existing_accounts)
+    all_discovered.update(mention_discoveries)
+    if mention_discoveries:
+        print(f"    Found {len(mention_discoveries)} accounts from @mentions")
+
+    # 2. Discover from hashtag exploration (Instaloader only)
+    if HAS_INSTALOADER:
+        loader = instaloader.Instaloader(
+            download_pictures=False, download_videos=False,
+            download_video_thumbnails=False, download_comments=False,
+            download_geotags=False, save_metadata=False,
+            compress_json=False, quiet=True,
+        )
+        combined = existing_accounts | set(all_discovered.keys())
+        hashtag_discoveries = discover_accounts_from_hashtags(loader, combined)
+        all_discovered.update(hashtag_discoveries)
+        if hashtag_discoveries:
+            print(f"    Found {len(hashtag_discoveries)} accounts from hashtags")
+
+    if not all_discovered:
+        print("    No new accounts discovered this run")
+
+    return all_discovered
+
+
+# ---------------------------------------------------------------------------
+# Social Media: Orchestrator
+# ---------------------------------------------------------------------------
+
+def run_social_scrapers() -> list[SampleSale]:
+    """Run all social media scrapers and account discovery."""
+    all_sales = []
+    all_posts = []
+
+    # Build combined account list: seed + previously discovered
+    ig_accounts = dict(SOCIAL_MEDIA_ACCOUNTS.get("instagram", {}))
+    threads_accounts = dict(SOCIAL_MEDIA_ACCOUNTS.get("threads", {}))
+
+    discovered = load_discovered_accounts()
+    for username, config in discovered.get("instagram", {}).items():
+        if username not in ig_accounts and config.get("enabled", False):
+            ig_accounts[username] = config
+    for username, config in discovered.get("threads", {}).items():
+        if username not in threads_accounts and config.get("enabled", False):
+            threads_accounts[username] = config
+
+    # Phase A: Instagram via Instaloader
+    print("\n  [Instagram] Scraping %d accounts..." % len(
+        [u for u, c in ig_accounts.items() if c.get("enabled")]
+    ))
+    ig_sales, ig_posts = run_instagram_scrapers(ig_accounts)
+    all_sales.extend(ig_sales)
+    all_posts.extend(ig_posts)
+
+    # Phase B: Threads via Playwright
+    print("\n  [Threads] Scraping %d accounts..." % len(
+        [u for u, c in threads_accounts.items() if c.get("enabled")]
+    ))
+    threads_sales, threads_posts = run_threads_scrapers(threads_accounts)
+    all_sales.extend(threads_sales)
+    all_posts.extend(threads_posts)
+
+    # Phase C: Account Discovery
+    existing = set(ig_accounts.keys()) | set(threads_accounts.keys())
+    new_accounts = run_account_discovery(all_posts, existing)
+    if new_accounts:
+        # Merge with existing discovered data and save
+        for username, config in new_accounts.items():
+            if username not in discovered.get("instagram", {}):
+                discovered.setdefault("instagram", {})[username] = config
+        save_discovered_accounts(discovered)
+
+    print(f"\n  Social media total: {len(all_sales)} sales from {len(all_posts)} posts")
+    return all_sales
+
+
+# ---------------------------------------------------------------------------
+# Scraper: Playwright + BeautifulSoup (Website Aggregators)
 # ---------------------------------------------------------------------------
 
 def get_page_html(page, url: str, wait_selector: str = "body", timeout: int = 30000) -> str:
@@ -762,7 +1442,12 @@ def save_markdown_table(sales: list[SampleSale], filename: str):
     lines = []
     lines.append("# NYC Sample Sales — March 2026\n")
     lines.append(f"*Data collected on 2026-03-08. {len(sales)} unique sales identified.*\n")
-    lines.append("**Sources:** 260 Sample Sale, Chicmi, Lazar Shopping, NYC Insider Guide, VIP Sample Sale\n")
+    # Dynamic sources from actual data
+    all_sources = set()
+    for s in sales:
+        for src in s.source.split(", "):
+            all_sources.add(src.strip())
+    lines.append(f"**Sources:** {', '.join(sorted(all_sources))}\n")
     lines.append("| # | Brand | Department | Start Date | End Date | Location | Link | Notes | Source(s) |")
     lines.append("|---|-------|-----------|------------|----------|----------|------|-------|-----------|")
     for i, s in enumerate(sales, 1):
@@ -785,17 +1470,21 @@ def main():
     print("  NYC Sample Sale Scraper — March 2026")
     print("=" * 60)
 
-    # Phase 1: Attempt live scraping
-    print("\n--- Phase 1: Live Scraping ---")
+    # Phase 1: Attempt live web scraping
+    print("\n--- Phase 1: Live Web Scraping ---")
     live_sales = run_live_scrapers()
 
-    # Phase 2: Load verified data
-    print("\n--- Phase 2: Verified Data ---")
+    # Phase 2: Social media scraping + account discovery
+    print("\n--- Phase 2: Social Media Scraping ---")
+    social_sales = run_social_scrapers()
+
+    # Phase 3: Load verified fallback data
+    print("\n--- Phase 3: Verified Fallback Data ---")
     verified_sales = get_verified_sales()
     print(f"  Loaded {len(verified_sales)} verified sales")
 
-    # Merge: live + verified
-    all_sales = live_sales + verified_sales
+    # Merge: web + social + verified
+    all_sales = live_sales + social_sales + verified_sales
     print(f"\nTotal raw sales: {len(all_sales)}")
 
     # Deduplicate

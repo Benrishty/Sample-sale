@@ -2,7 +2,7 @@
 
 *Data collected on 2026-03-08. 26 unique sales identified.*
 
-**Sources:** 260 Sample Sale, Chicmi, Lazar Shopping, NYC Insider Guide, VIP Sample Sale
+**Sources:** 260 Sample Sale, Chicmi, NYC Insider Guide, VIP Sample Sale
 
 | # | Brand | Department | Start Date | End Date | Location | Link | Notes | Source(s) |
 |---|-------|-----------|------------|----------|----------|------|-------|-----------|
