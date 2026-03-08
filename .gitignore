@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+discovered_accounts.json
+debug_*.html
